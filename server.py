@@ -17,23 +17,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("DDChatRelay")
 
 # ─── Приложение ─────────────────────────────────────────────────────────────
-app = FastAPI(title="DeepDrift Secure Relay", version="4.2.0")
+app = FastAPI(title="DeepDrift Secure Relay", version="4.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ─── Конфигурация ───────────────────────────────────────────────────────────
 REDIS_URL = os.environ.get("REDIS_URL")
 FB_JSON   = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
 
-UID_PATTERN = re.compile(r"^\d{6}$")  # UID — строго 6 цифр
+UID_PATTERN = re.compile(r"^\d{6}$")
 
 # ─── Глобальное состояние ───────────────────────────────────────────────────
 active_connections: Dict[str, WebSocket] = {}
 redis_client: Optional[redis.Redis] = None
 
-# Rate limiting: uid -> [timestamp, ...]
 _rate_limit: Dict[str, list] = {}
-RATE_LIMIT_MAX   = 60   # сообщений
-RATE_LIMIT_WINDOW = 60  # секунд
+RATE_LIMIT_MAX    = 60
+RATE_LIMIT_WINDOW = 60
 
 # ─── Firebase ───────────────────────────────────────────────────────────────
 try:
@@ -86,10 +85,8 @@ def _is_valid_uid(uid: str) -> bool:
 
 
 def _check_rate_limit(uid: str) -> bool:
-    """Возвращает True если запрос разрешён."""
     now = datetime.now().timestamp()
     timestamps = _rate_limit.get(uid, [])
-    # Удаляем устаревшие записи
     timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
     if len(timestamps) >= RATE_LIMIT_MAX:
         return False
@@ -97,14 +94,13 @@ def _check_rate_limit(uid: str) -> bool:
     _rate_limit[uid] = timestamps
     return True
 
+
 def _clean_rate_limit(uid: str):
-    """Очистка памяти при отключении."""
     if uid in _rate_limit:
         del _rate_limit[uid]
 
 
 async def _send_to(ws: WebSocket, payload: dict):
-    """Безопасная отправка JSON клиенту."""
     try:
         await ws.send_text(json.dumps(payload))
     except Exception as e:
@@ -112,144 +108,144 @@ async def _send_to(ws: WebSocket, payload: dict):
 
 
 async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "new_message"):
-    """Асинхронная FCM-пуш-нотификация (не блокирует event loop)."""
+    """Асинхронная FCM-пуш-нотификация."""
     if not redis_client or not firebase_admin._apps:
         return
     try:
         token = await redis_client.get(f"fcm_token:{target_uid}")
         if not token:
+            logger.debug(f"📵 No FCM token for {target_uid}, skipping push")
             return
 
         title_map = {
-            "new_message":       f"DeepDrift: {from_uid[:8]}",
-            "message_deleted":   "Message deleted",
-            "message_edited":    "Message edited",
-            "message_reaction":  "New reaction",
+            "new_message":      f"DDChat: {from_uid}",
+            "message_deleted":  "Message deleted",
+            "message_edited":   "Message edited",
+            "message_reaction": "New reaction",
         }
         body_map = {
-            "new_message":       "New encrypted message",
-            "message_deleted":   "A message was deleted",
-            "message_edited":    "A message was edited",
-            "message_reaction":  "New reaction on your message",
+            # ── БАГ 3 FIX: тело пуша НИКОГДА не содержит текст сообщения ──
+            # Всегда нейтральная заглушка — никакого "no encryption" в пушах
+            "new_message":      "New encrypted message",
+            "message_deleted":  "A message was deleted",
+            "message_edited":   "A message was edited",
+            "message_reaction": "New reaction on your message",
         }
 
         msg = messaging.Message(
             notification=messaging.Notification(
-                title=title_map.get(message_type, "DeepDrift"),
+                title=title_map.get(message_type, "DDChat"),
                 body=body_map.get(message_type, "New event"),
             ),
+            # data-поля нужны Flutter для открытия нужного чата
             data={"from_uid": from_uid, "type": message_type},
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    priority="max",
+                    default_vibrate_timings=True,
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(content_available=True),
+                ),
+            ),
             token=token,
         )
-        # Запускаем синхронный вызов в thread pool
         await asyncio.get_event_loop().run_in_executor(None, messaging.send, msg)
         logger.info(f"📲 Push sent to {target_uid} ({message_type})")
+    except messaging.UnregisteredError:
+        # ── БАГ 3 FIX: токен протух → удаляем из Redis ──────────────────
+        logger.warning(f"🗑️ FCM token for {target_uid} is unregistered, removing from Redis")
+        if redis_client:
+            await redis_client.delete(f"fcm_token:{target_uid}")
     except Exception as e:
         logger.error(f"❌ Push Send Error: {e}")
 
 
-# ─── Оффлайн сообщения (Global) ─────────────────────────────────────────────
-async def _send_offline_messages(websocket: WebSocket, my_uid: str):
-    """Доставка ВСЕХ оффлайн-сообщений при подключении (Legacy/Init)."""
+# ─── Оффлайн сообщения ──────────────────────────────────────────────────────
+
+async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_uid: str):
+    """
+    БАГ 1 + БАГ 2 + БАГ 4 FIX:
+    Доставляем оффлайн-сообщения ТОЛЬКО по явному запросу клиента,
+    ТОЛЬКО из очереди конкретного отправителя.
+    Глобальная автодоставка при init УДАЛЕНА — она была причиной доставки
+    сообщений до того как Flutter успевал загрузить ключи шифрования.
+    """
     if not redis_client:
         return
-    await asyncio.sleep(0.5)
     try:
-        offline_key = f"offline_queue:{my_uid}"
+        offline_key = f"offline:{my_uid}:from:{from_uid}"
         messages = await redis_client.lrange(offline_key, 0, -1)
+
         if messages:
-            logger.info(f"📬 Sending {len(messages)} global offline messages to {my_uid}")
+            logger.info(f"📬 Delivering {len(messages)} offline messages from {from_uid} to {my_uid}")
             for msg_json in messages:
                 try:
                     await websocket.send_text(msg_json)
                 except Exception as e:
                     logger.error(f"❌ Failed to send offline message: {e}")
-            await redis_client.delete(offline_key)
-            logger.info(f"🗑️ Cleared global offline queue for {my_uid}")
-    except Exception as e:
-        logger.error(f"❌ Error sending offline messages: {e}")
+                    # Не удаляем очередь если доставка упала
+                    return
 
-
-# ─── Оффлайн сообщения (Specific Sender) - NEW ──────────────────────────────
-async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_uid: str):
-    """Доставка оффлайн-сообщений от конкретного отправителя."""
-    if not redis_client:
-        return
-    try:
-        # Ключ для сообщений от конкретного отправителя
-        offline_key = f"offline:{my_uid}:from:{from_uid}"
-        messages = await redis_client.lrange(offline_key, 0, -1)
-        
-        if messages:
-            logger.info(f"📬 Sending {len(messages)} specific offline messages from {from_uid} to {my_uid}")
-            for msg_json in messages:
-                try:
-                    await websocket.send_text(msg_json)
-                except Exception as e:
-                    logger.error(f"❌ Failed to send specific offline message: {e}")
-            
-            # Удаляем отправленные сообщения
             await redis_client.delete(offline_key)
-            logger.info(f"🗑️ Cleared specific offline queue for {my_uid} from {from_uid}")
+            logger.info(f"🗑️ Cleared offline queue for {my_uid} from {from_uid}")
         else:
-            logger.debug(f"📭 No specific offline messages from {from_uid} for {my_uid}")
-            
+            logger.debug(f"📭 No offline messages from {from_uid} for {my_uid}")
+
     except Exception as e:
-        logger.error(f"❌ Error sending specific offline messages from {from_uid}: {e}")
+        logger.error(f"❌ Error delivering offline messages from {from_uid}: {e}")
 
 
 async def _store_offline_message(target_uid: str, message_data: dict):
-    """Сохранение сообщения для оффлайн-доставки (Dual Storage)."""
+    """
+    БАГ 4 FIX: Храним ТОЛЬКО в очереди конкретного отправителя.
+    Двойное хранение (dual storage) удалено — оно приводило к двойной доставке.
+    """
     if not redis_client:
         return
     try:
         from_uid = message_data.get("from_uid", "unknown")
-        
-        # 1. Сохраняем в общую очередь (для старой логики init)
-        offline_key_global = f"offline_queue:{target_uid}"
-        await redis_client.rpush(offline_key_global, json.dumps(message_data))
-        await redis_client.expire(offline_key_global, 7 * 24 * 3600)
-        
-        # 2. НОВОЕ: Сохраняем по отправителям (для нового запроса)
-        offline_key_specific = f"offline:{target_uid}:from:{from_uid}"
-        await redis_client.rpush(offline_key_specific, json.dumps(message_data))
-        await redis_client.expire(offline_key_specific, 7 * 24 * 3600)
-        
-        logger.info(f"💾 Stored offline message for {target_uid} from {from_uid} (Dual storage)")
+        offline_key = f"offline:{target_uid}:from:{from_uid}"
+        await redis_client.rpush(offline_key, json.dumps(message_data))
+        await redis_client.expire(offline_key, 7 * 24 * 3600)  # 7 дней
+        logger.info(f"💾 Stored offline message for {target_uid} from {from_uid}")
     except Exception as e:
         logger.error(f"❌ Failed to store offline message: {e}")
 
 
 async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from_uid: str):
-    """Доставить сообщение онлайн, либо сохранить оффлайн и отправить push."""
+    """Доставить онлайн, либо сохранить оффлайн и отправить push."""
     if target_uid in active_connections:
         try:
             await active_connections[target_uid].send_text(json.dumps(payload))
             return True
         except Exception as e:
             logger.error(f"❌ Failed to deliver to {target_uid}: {e}")
-    
+
     await _store_offline_message(target_uid, payload)
     await _send_fcm_push(target_uid, from_uid, push_type)
     return False
 
 
-# ─── REST эндпоинты ─────────────────────────────────────────────────────────
+# ─── REST ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
     return {
         "status": "ONLINE",
-        "version": "4.2.0",
+        "version": "4.3.0",
         "firebase": "active" if firebase_admin._apps else "error/disabled",
         "redis": "connected" if redis_client else "disconnected",
         "users_online": len(active_connections),
         "features": [
-            "dual_offline_storage", "request_offline_messages",
+            "single_offline_storage", "explicit_request_offline_messages",
             "delete_message", "edit_message", "message_reaction",
             "forward_message", "read_receipt", "delivery_receipt",
             "voice_messages", "photo_messages", "file_transfer",
-            "server_ack", "rate_limiting",
+            "server_ack", "rate_limiting", "fcm_token_cleanup",
         ],
     }
 
@@ -286,12 +282,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     "type": "uid_assigned",
                     "my_uid": my_uid,
                 })
-
-                # Отправляем глобальные оффлайн сообщения (Legacy)
-                asyncio.create_task(_send_offline_messages(websocket, my_uid))
+                # ── БАГ 1 + БАГ 2 FIX ────────────────────────────────────
+                # Глобальная автодоставка удалена.
+                # Клиент сам вызовет request_offline_messages когда откроет чат
+                # и убедится что ключи шифрования загружены.
                 continue
 
-            # Все дальнейшие сообщения требуют авторизации
             if not my_uid:
                 await _send_to(websocket, {
                     "type": "error",
@@ -299,17 +295,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 continue
 
-            # ── NEW: REQUEST OFFLINE MESSAGES ─────────────────────────────
+            # ── REQUEST OFFLINE MESSAGES ──────────────────────────────────
             if msg_type == "request_offline_messages":
-                # Клиент отправляет 'target_uid' (с кем чатится), 
-                # для сервера это 'from_uid' (от кого достать сообщения)
-                target_from_uid = data.get("target_uid") or data.get("from_uid")
-                
-                if not target_from_uid:
+                from_uid = data.get("target_uid") or data.get("from_uid")
+                if not from_uid:
                     continue
-                
-                logger.info(f"📥 {my_uid} requested offline messages from {target_from_uid}")
-                await _send_offline_messages_from(websocket, my_uid, target_from_uid)
+                logger.info(f"📥 {my_uid} requested offline messages from {from_uid}")
+                await _send_offline_messages_from(websocket, my_uid, from_uid)
                 continue
 
             # ── REGISTER FCM TOKEN ────────────────────────────────────────
@@ -317,15 +309,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 token = data.get("fcm_token")
                 if redis_client and token:
                     await redis_client.set(f"fcm_token:{my_uid}", token)
-                    logger.info(f"📱 Token registered for {my_uid}")
+                    # Токен не протухает — обновляем по onTokenRefresh на клиенте
+                    logger.info(f"📱 FCM token registered for {my_uid}")
                     await _send_to(websocket, {"type": "fcm_token_registered", "status": "success"})
                 continue
 
             # ── REGISTER PUBLIC KEY ───────────────────────────────────────
             if msg_type == "register_public_key":
-                x25519_key = data.get("x25519_key")
+                x25519_key  = data.get("x25519_key")
                 ed25519_key = data.get("ed25519_key")
-
                 if redis_client and x25519_key and ed25519_key:
                     await redis_client.setex(f"pubkey:{my_uid}:x25519",  30 * 24 * 3600, x25519_key)
                     await redis_client.setex(f"pubkey:{my_uid}:ed25519", 30 * 24 * 3600, ed25519_key)
@@ -336,25 +328,22 @@ async def websocket_endpoint(websocket: WebSocket):
             # ── REQUEST PUBLIC KEY ────────────────────────────────────────
             if msg_type == "request_public_key":
                 target_uid = data.get("target_uid")
-
                 if redis_client and target_uid:
                     try:
                         x25519_key  = await redis_client.get(f"pubkey:{target_uid}:x25519")
                         ed25519_key = await redis_client.get(f"pubkey:{target_uid}:ed25519")
-
                         if x25519_key and ed25519_key:
                             await _send_to(websocket, {
-                                "type": "public_key_response",
+                                "type":       "public_key_response",
                                 "target_uid": target_uid,
                                 "x25519_key": x25519_key,
                                 "ed25519_key": ed25519_key,
                             })
-                            logger.info(f"🔑 Sent public keys of {target_uid} to {my_uid}")
                         else:
                             await _send_to(websocket, {
-                                "type": "public_key_response",
+                                "type":       "public_key_response",
                                 "target_uid": target_uid,
-                                "error": "keys_not_found",
+                                "error":      "keys_not_found",
                             })
                     except Exception as e:
                         logger.error(f"❌ Error retrieving keys: {e}")
@@ -362,7 +351,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # ── MESSAGE ───────────────────────────────────────────────────
             if msg_type == "message":
-                # Rate limiting
                 if not _check_rate_limit(my_uid):
                     await _send_to(websocket, {"type": "error", "message": "Rate limit exceeded"})
                     continue
@@ -382,23 +370,22 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 payload = {
-                    "type":          "message",
-                    "from_uid":      my_uid,
-                    "id":            message_id,
+                    "type":           "message",
+                    "from_uid":       my_uid,
+                    "id":             message_id,
                     "encrypted_text": encrypted_text,
-                    "signature":     signature,
-                    "time":          _now_ms(),
-                    "replyToId":     reply_to_id,
-                    "messageType":   message_type,
-                    "mediaData":     media_data,
-                    "fileName":      file_name,
-                    "fileSize":      file_size,
-                    "mimeType":      mime_type,
+                    "signature":      signature,
+                    "time":           _now_ms(),
+                    "replyToId":      reply_to_id,
+                    "messageType":    message_type,
+                    "mediaData":      media_data,
+                    "fileName":       file_name,
+                    "fileSize":       file_size,
+                    "mimeType":       mime_type,
                 }
 
                 delivered = await _deliver_or_store(target_uid, payload, "new_message", my_uid)
 
-                # ✅ server_ack
                 await _send_to(websocket, {
                     "type":             "server_ack",
                     "id":               message_id,
@@ -411,10 +398,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg_type == "delete_message":
                 target_uid = data.get("target_uid")
                 message_id = data.get("message_id")
-
                 if not all([target_uid, message_id]):
                     continue
-
                 payload = {
                     "type":       "message_deleted",
                     "from_uid":   my_uid,
@@ -422,29 +407,27 @@ async def websocket_endpoint(websocket: WebSocket):
                     "time":       _now_ms(),
                 }
                 await _deliver_or_store(target_uid, payload, "message_deleted", my_uid)
-                logger.info(f"🗑️ Delete request: {message_id}")
+                logger.info(f"🗑️ Delete: {message_id}")
                 continue
 
             # ── EDIT MESSAGE ──────────────────────────────────────────────
             if msg_type == "edit_message":
-                target_uid        = data.get("target_uid")
-                message_id        = data.get("message_id")
+                target_uid         = data.get("target_uid")
+                message_id         = data.get("message_id")
                 new_encrypted_text = data.get("new_encrypted_text")
                 new_signature      = data.get("new_signature")
-
                 if not all([target_uid, message_id, new_encrypted_text]):
                     continue
-
                 payload = {
-                    "type":              "message_edited",
-                    "from_uid":          my_uid,
-                    "message_id":        message_id,
+                    "type":               "message_edited",
+                    "from_uid":           my_uid,
+                    "message_id":         message_id,
                     "new_encrypted_text": new_encrypted_text,
                     "new_signature":      new_signature,
-                    "time":              _now_ms(),
+                    "time":               _now_ms(),
                 }
                 await _deliver_or_store(target_uid, payload, "message_edited", my_uid)
-                logger.info(f"✏️ Edit delivered: {message_id}")
+                logger.info(f"✏️ Edit: {message_id}")
                 continue
 
             # ── MESSAGE REACTION ──────────────────────────────────────────
@@ -452,11 +435,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 target_uid = data.get("target_uid")
                 message_id = data.get("message_id")
                 emoji      = data.get("emoji")
-                action     = data.get("action")  # 'add' | 'remove'
-
+                action     = data.get("action")
                 if not all([target_uid, message_id, emoji, action]):
                     continue
-
                 payload = {
                     "type":       "message_reaction",
                     "from_uid":   my_uid,
@@ -467,7 +448,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 }
                 if target_uid in active_connections:
                     await _send_to(active_connections[target_uid], payload)
-                    logger.info(f"{emoji} Reaction delivered: {emoji} on {message_id}")
                 else:
                     await _send_fcm_push(target_uid, my_uid, "message_reaction")
                 continue
@@ -480,10 +460,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 encrypted_text      = data.get("encrypted_text")
                 signature           = data.get("signature")
                 new_message_id      = data.get("id")
-
                 if not all([target_uid, original_message_id, encrypted_text, new_message_id]):
                     continue
-
                 payload = {
                     "type":                "message",
                     "from_uid":            my_uid,
@@ -495,23 +473,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     "original_message_id": original_message_id,
                 }
                 await _deliver_or_store(target_uid, payload, "new_message", my_uid)
-
                 await _send_to(websocket, {
                     "type":             "server_ack",
                     "id":               new_message_id,
                     "delivered_online": target_uid in active_connections,
                 })
-                logger.info(f"↪️ Forward delivered: {new_message_id}")
+                logger.info(f"↪️ Forward: {new_message_id}")
                 continue
 
             # ── READ RECEIPT ──────────────────────────────────────────────
             if msg_type == "read_receipt":
                 target_uid = data.get("target_uid")
                 message_id = data.get("message_id")
-
                 if not all([target_uid, message_id]):
                     continue
-
                 payload = {
                     "type":       "read_receipt",
                     "from_uid":   my_uid,
@@ -520,17 +495,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 }
                 if target_uid in active_connections:
                     await _send_to(active_connections[target_uid], payload)
-                    logger.info(f"✓✓ Read receipt delivered: {message_id}")
                 continue
 
             # ── DELIVERY RECEIPT ──────────────────────────────────────────
             if msg_type == "delivery_receipt":
                 target_uid = data.get("target_uid")
                 message_id = data.get("message_id")
-
                 if not all([target_uid, message_id]):
                     continue
-
                 payload = {
                     "type":       "delivery_receipt",
                     "from_uid":   my_uid,
@@ -539,14 +511,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 }
                 if target_uid in active_connections:
                     await _send_to(active_connections[target_uid], payload)
-                    logger.info(f"✓ Delivery receipt sent: {message_id}")
                 continue
 
             # ── TYPING INDICATOR ──────────────────────────────────────────
             if msg_type == "typing_indicator":
                 target_uid = data.get("target_uid")
                 typing     = data.get("typing", False)
-
                 if target_uid and target_uid in active_connections:
                     await _send_to(active_connections[target_uid], {
                         "type":     "typing_indicator",
@@ -560,12 +530,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 await _send_to(websocket, {"type": "pong"})
                 continue
 
-            logger.warning(f"⚠️ Unknown message type: {msg_type} from {my_uid}")
+            logger.warning(f"⚠️ Unknown type: {msg_type} from {my_uid}")
 
     except WebSocketDisconnect:
         if my_uid:
             active_connections.pop(my_uid, None)
-            _clean_rate_limit(my_uid) # Очистка памяти
+            _clean_rate_limit(my_uid)
             logger.info(f"👋 {my_uid} disconnected (total: {len(active_connections)})")
     except Exception as e:
         logger.error(f"❌ WebSocket error: {e}")
